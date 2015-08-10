@@ -1,0 +1,151 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use bytes;
+
+print STDERR "== renay server\n";
+
+# daemonize
+if (@ARGV && $ARGV[0] eq '-d') {
+	shift @ARGV;
+	use POSIX qw(setsid);
+
+	print STDERR "=> daemonizing...\n";
+	chdir '/' or die ">> chdir /: $!\n";
+	open STDIN, '<', '/dev/null' or die ">> open /dev/null for read: $!\n";
+	open STDOUT, '>', '/dev/null' or die ">> open /dev/null for write: $!\n";
+	defined(my $pid = fork) or die ">> fork: $!\n";
+	if ($pid) {
+		print STDERR ":: daemon pid [$pid]\n";
+		exit;
+	}
+
+	setsid() == -1 and die ">> start new session: $!\n";
+	open STDERR, '>&STDOUT' or die ">> redirect stderr to stdout: $!\n";
+}
+
+# server config
+my $PROTOCOL_VERSION = '1';
+my $PORT = shift || 22295;
+my $MAX_SESSION = shift || 4;
+$PORT =~ /\d+/ or die "port must be a number.\n";
+$MAX_SESSION =~ /\d+/ or die "max-session must be a number.\n";
+
+
+use IO::Socket;
+use IO::Select;
+
+print STDERR "=> starting udp server...\n";
+my $udp = IO::Socket::INET->new(
+	Proto => 'udp',
+	LocalPort => $PORT,
+	ReuseAddr => 1,
+	ReusePort => 1,
+) or die "$!\n";
+print STDERR ":: listening on ", $udp->sockport, "\n";
+
+my $sockets = IO::Select->new($udp);
+my %udp_sessions;
+my %udp_peers;
+
+sub send_error
+{
+	my ($sock, $msg, $peer) = @_;
+	chomp $msg;
+	$msg = "renay error\n$msg\n";
+
+	if (defined $peer) { $sock->send($msg, undef, $peer) }
+	else { $sock->send($msg) }
+}
+
+while (my @ready = $sockets->can_read) {
+	for my $s (@ready) {
+		if ($s == $udp) {
+			my $peer = $s->recv(my $data, 64*1024);
+
+			# new peer authentication
+			unless (exists $udp_peers{$peer}) {
+				$data =~ s{[\r\n]+$}{};
+				unless ($data =~ m{renay\s+([^\s]+)\s+([^\s]+)$}) {
+					send_error($s, "bad request", $peer);
+					next;
+				}
+				my ($ver, $sid) = ($1, $2);
+
+				# protocol version compatibility check
+				if ($ver ne $PROTOCOL_VERSION) {
+					send_error($s, "expect version $PROTOCOL_VERSION", $peer);
+					next;
+				}
+
+				# bind peer
+				$udp_peers{$peer} = $sid;
+
+				# create session
+				unless (exists $udp_sessions{$sid}) {
+					# session quota check
+					if ($MAX_SESSION && keys %udp_sessions == $MAX_SESSION) {
+						send_error($s, "session quota [$MAX_SESSION] reached", $peer);
+						delete $udp_peers{$peer};
+						next;
+					}
+
+					$udp_sessions{$sid} = {
+						peers => { $peer => undef },
+					};
+					$s->send("renay wait\n", undef, $peer);
+					print STDERR "=> session [$sid] created\n";
+					next;
+				}
+
+				# attempt to join session
+				my $session = $udp_sessions{$sid};
+				my $peers = $session->{peers};
+
+				# reset session
+				if (keys %$peers == 2) {
+					$udp_sessions{$sid} = {
+						peers => { $peer => undef },
+					};
+					for (keys %$peers) {
+						send_error($s, "close", $_);
+						delete $udp_peers{$_};
+					}
+					$s->send("renay wait\n", undef, $peer);
+					print STDERR "=> session [$sid] reseted\n";
+					next;
+				}
+
+				# join session
+				my ($peer2) = keys %$peers;
+				$peers->{$peer} = $peer2;
+				$peers->{$peer2} = $peer;
+				$s->send("renay join\n", undef, $peer);
+				$s->send("renay join\n", undef, $peer2);
+				print STDERR "=> session [$sid] joined\n";
+				next;
+			}
+
+			# authenticated peer
+			my $sid = $udp_peers{$peer};
+			my $session = $udp_sessions{$sid};
+			my $peers = $session->{peers};
+
+			# cat to joined peer
+			if (keys %$peers == 2) {
+				$s->send($data, undef, $peers->{$peer}) and next;
+			}
+
+			# close session
+			delete $udp_sessions{$sid};
+			for (keys %$peers) {
+				send_error($s, "close", $_);
+				delete $udp_peers{$_};
+			}
+			print STDERR "=> session [$sid] closed\n";
+
+			next;
+		}
+	}
+}
+

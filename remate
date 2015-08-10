@@ -1,0 +1,175 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use bytes;
+
+print STDERR "== remate\n";
+
+# client config
+my $PROTOCOL_VERSION = '1';
+my $SESSION = shift || die ">> session required.\n";
+my $SERVER = shift || die ">> server required.\n";
+my $PORT = shift || 22295;
+
+
+use IO::Socket;
+use IO::Select;
+
+print STDERR "=> start renay client...\n";
+my $renay = IO::Socket::INET->new(
+	Proto => 'udp',
+	PeerPort => $PORT,
+	PeerAddr => $SERVER,
+) or die "$!\n";
+print STDERR ":: service from ", $renay->peerhost, ":", $renay->peerport, "\n";
+
+# establish session
+print STDERR "=> establishing session [$SESSION]...\n";
+$renay->send("renay $PROTOCOL_VERSION $SESSION\n");
+my $wait = 1;
+my $master = undef;
+while ($wait) {
+	$renay->recv(my $data, 64*1024);
+	for ($data) {
+		s{^renay error\n}{} and die ">> $_";
+		m{^renay wait\n} and do {
+			print STDERR ":: waiting peer\n";
+			$master = 1;
+			next;
+		};
+		m{^renay join\n} and do {
+			print STDERR ":: joined\n";
+			$wait = 0;
+			next;
+		};
+		die ">> unknown packet: $data\n";
+	}
+}
+
+if ($master) {
+	print STDERR ":: master session\n";
+	my ($port, $key) = mosh::server(sub { $renay->send("error\n"); });
+
+	print STDERR "=> starting local client...\n";
+	my $local = IO::Socket::INET->new(
+		Proto => 'udp',
+		PeerAddr => '127.0.0.1',
+		PeerPort => $port,
+	) or die "$!\n";
+	print STDERR ":: service from ", $local->peerport, "\n";
+
+	print STDERR "=> activating remote peer...\n";
+	$renay->send("key $key\n");
+
+	mosh::tmux();
+
+	print STDERR ":: mosh established\n";
+	my $sockets = IO::Select->new($renay, $local);
+	while (my @ready = $sockets->can_read) {
+		for my $s (@ready) {
+			if ($s == $renay) {
+				$renay->recv(my $data, 64*1024);
+				#print STDERR ":: renay -> [", length($data), "]\n";
+				$local->send($data) or die $!;
+				next;
+			}
+
+			$local->recv(my $data, 64*1024);
+			#print STDERR ":: local -> [", length($data), "]\n";
+			$renay->send($data) or die $!;
+		}
+	}
+}
+else {
+	print STDERR ":: slave session\n";
+
+	print STDERR "=> waiting activation from remote peer...\n";
+	my $key;
+	$renay->recv(my $data, 64*1024);
+	for ($data) {
+		s{^renay error\n}{} and die ">> $_";
+		m{^error\n} and die ">> peer died\n";
+		m{^key ([^\s]+)\n} and do {
+			$key = $1;
+			next;
+		};
+		die ">> unknown packet: $data\n";
+	}
+	print STDERR ":: key [$key]\n";
+
+	print STDERR "=> starting local server...\n";
+	my $local = IO::Socket::INET->new(
+		Proto => 'udp',
+		LocalAddr => '127.0.0.1',
+	) or die "$!\n";
+	my $port = $local->sockport;
+	print STDERR ":: service on ", $port, "\n";
+
+	mosh::client($port, $key);
+
+	print STDERR ":: mosh established\n";
+	my $sockets = IO::Select->new($renay, $local);
+	while (my @ready = $sockets->can_read) {
+		for my $s (@ready) {
+			if ($s == $renay) {
+				$renay->recv(my $data, 64*1024);
+				#print STDERR ":: local -> [", length($data), "]\n";
+				$local->send($data);
+				next;
+			}
+
+			$local->recv(my $data, 64*1024);
+			#print STDERR ":: local -> [", length($data), "]\n";
+			$renay->send($data);
+		}
+	}
+}
+
+package mosh
+{
+	sub server
+	{
+		my ($error_callback) = @_;
+
+		print STDERR "=> starting mosh server...\n";
+
+		use IPC::Open2;
+		my $pid = open2(my $out, undef, 'mosh-server', 'new', '-c', '256', '--', 'tmux', '-L', "remate-$SESSION", 'new', '-A', '-s', 'remate');
+		my ($port, $key);
+		while (local $_ = <$out>) {
+			chomp;
+			m{MOSH CONNECT (\d+) ([^\s]+)} and do {
+				($port, $key) = ($1, $2);
+				last;
+			}
+		}
+
+		waitpid $pid, 0;
+		if ($?) {
+			$error_callback->() if defined $error_callback;
+			die ">> failed to start mosh-server";
+		}
+
+		print STDERR ":: listening on $port\n";
+		return $port, $key;
+	}
+
+	sub client
+	{
+		my ($port, $key) = @_;
+
+		print STDERR "=> starting mosh client...\n";
+		return if fork;
+		$ENV{MOSH_KEY} = $key;
+		exec('mosh-client', '127.0.0.1', $port) or die $!;
+	}
+
+	sub tmux
+	{
+		print STDERR "=> starting local tmux...\n";
+		return if fork;
+		delete $ENV{TMUX};
+		exec('tmux', '-L', "remate-$SESSION", 'new', '-A', '-s', 'remate') or die $!;
+	}
+}
+

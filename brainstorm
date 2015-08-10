@@ -1,0 +1,27 @@
+renay
+renay-server
+renay-mate
+
+renay NAME LOCAL_SERVICE
+renay-server
+renay-mate NAME
+
+== renay relay ==
+tcp.
+
+client connect either to tcp or udp:
+	renay VERSION NAME64
+
+server check version, if incompatible:
+	renay error SIZE
+	ERROR-MESSAGE
+then close connection
+
+otherwise, prepare connection and send either
+	renay wait
+	renay pair
+
+when client received renay pair, ping back
+	renay pair
+
+
