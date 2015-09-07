@@ -133,8 +133,8 @@ package mosh
 
 		print STDERR "=> starting mosh server...\n";
 
-		use IPC::Open2;
-		my $pid = open2(my $out, undef, 'mosh-server', 'new', '-c', '256', '--', 'tmux', '-L', "remate-$SESSION", 'new', '-A', '-s', 'remate');
+		use IPC::Open3;
+		my $pid = open3(undef, my $out, undef, 'mosh-server', 'new', '-c', '256', '--', 'tmux', '-L', "remate-$SESSION", 'new', '-A', '-s', 'remate');
 		my ($port, $key);
 		while (local $_ = <$out>) {
 			chomp;
