@@ -1,0 +1,19 @@
+# Maintainer: Giumo Clanjor <cjxgm@126.com>
+pkgname=renay
+pkgver=0.10
+pkgrel=1
+pkgdesc="renay relay"
+arch=(any)
+license=('MIT')
+depends=(perl)
+optdepends=('mosh: in order to use remate'
+			'tmux: in order to use remate')
+source=("$pkgname.tar")
+md5sums=(SKIP)
+
+package() {
+	cd "$pkgname"
+	mkdir -p "$pkgdir/usr/bin/"
+	cp * "$pkgdir/usr/bin/"
+}
+
